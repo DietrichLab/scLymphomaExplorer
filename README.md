@@ -1,1 +1,1 @@
-# LymphNodeExplorer
+# scLymphomaExplorer
