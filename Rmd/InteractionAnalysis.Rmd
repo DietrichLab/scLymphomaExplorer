@@ -1,0 +1,408 @@
+---
+title: "scRNA-seq data analysis of lymph node derived B cell lymphoma samples"
+subtitle: "Ligand-Receptor-Interactions between T cells and malignant/non-malignant B cells"
+author: Tobias Roider, Sascha Dietrich
+date: "`r doc_date()`"
+output: 
+    BiocStyle::html_document:
+        toc: true
+        self_contained: true
+        toc_float: false
+        code_download: true
+        df_print: paged
+        toc_depth: 2
+        highlight: tango
+    BiocStyle::pdf_document:
+        toc: true
+        toc_depth: 2
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r options, include=FALSE, warning = FALSE}
+library(knitr)
+options(digits=3, width=80)
+golden_ratio <- (1 + sqrt(5)) / 2
+opts_chunk$set(echo=TRUE,tidy=FALSE,include=TRUE,
+               dev=c('png'), fig.height = 5, fig.width = 4 * golden_ratio, comment = '  ', dpi = 300,
+cache = TRUE, warning = FALSE)
+
+```
+
+ **LAST UPDATE AT**
+
+```{r, echo=FALSE, cache=FALSE, warning = FALSE}
+print(date())
+```
+
+This rmd file belongs to the __Manuscript__:  
+  
+_"Dissecting intratumor heterogeneity of nodal B cell lymphoma on the transcriptional, genetic, and drug response level"_  
+Roider _et al._  
+doi: ...  
+
+It summarizes the ligand-receptor interaction analysis adapted from Vento-Tormo et al. (Nature 2018)
+
+__Sample abbreviations:__  
+DLBCL: Diffuse large B cell lymphoma  
+tFL: Transformed follicular lymphoma  
+FL: Follicular lymphopma  
+rLN: Reactive lymph node
+
+# Libraries
+```{r message=F}
+
+library(tidyverse)
+library(Seurat)
+library(grid)
+library(metaseqR)
+
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+```
+
+# Get data function
+Extract data from Seurat Objects
+```{r}
+
+get.data <- function(Sobj, genes) {
+  
+  # Extract Meta data
+  df.meta <- data.frame(Cluster = Sobj@ident, Sobj@meta.data)
+  
+  # Extract gene expression data for expressed genes
+  genes.red <- rownames(Sobj@data)[rownames(Sobj@data) %in% genes]
+  dftotal <-  cbind(df.meta, FetchData(Sobj, genes.red))
+  
+  return(dftotal)
+  
+}
+
+```
+
+# Create Expression Matrices for B and T cells
+```{r}
+
+# Read data frame with Interactions (e.g. first column "Ligand", second column "Receptor")
+DF.Interaction <- read_excel(Filename)
+
+# Load list of Seurat Objects
+# Meta data should contain a column "Population_merge" which contains information about cell type
+NewSobj <- readRDS(file = "NewSobj.rds")
+
+# How do the data look
+get.data(NewSobj$tFL1, c("CD28", "CD86")) %>% 
+  filter(!is.na(Population_Merge)) %>%
+  .[, c("Population_Merge", "CD28", "CD86")] %>%
+  group_by(Population_Merge) %>% 
+  summarise_all(., mean)
+
+```
+
+# Calculate Interaction for all pairs and all 
+```{r}
+
+InteractionPair <- lapply(1:nrow(DF.Interaction), function(z) {
+  
+  InteractionSample <- lapply(NewSobj, function(x) {
+      
+      Ligand <- DF.Interaction$Ligand[z]
+      Receptor <- DF.Interaction$Receptor[z]
+ 
+      df <-  get.data(x, c(Ligand, Receptor)) %>% 
+        filter(!is.na(Population_Merge))
+
+      if(is.null(df[[Ligand]]) | is.null(df[[Receptor]]))
+        
+      { df <- NULL
+      
+      } else {
+
+        df <- df[, c("Population_Merge", Ligand, Receptor)] 
+        
+        df <- df %>% group_by(Population_Merge) %>% 
+          summarise_all(., mean)
+      
+        Expr.Ligand <-  df %>% group_by(Cluster_L=Population_Merge) %>% 
+          .[, c("Cluster_L", colnames(df)[2])]
+        Expr.Receptor <- df %>% group_by(Cluster_R=Population_Merge) %>% 
+          .[, c("Cluster_R", colnames(df)[3])]
+        
+        grid <- expand.grid(Cluster_L=Expr.Ligand$Cluster_L, 
+                            Cluster_R= Expr.Receptor$Cluster_R, 
+                            stringsAsFactors = FALSE)
+        
+        df <- left_join(grid, Expr.Ligand, by="Cluster_L") %>% 
+          left_join(., Expr.Receptor, by="Cluster_R") %>% 
+          mutate(Interaction=get(colnames(df)[2])*get(colnames(df)[3]))
+        
+      }
+      
+      return(df)
+      
+    })
+    
+    InteractionRepl <- bind_rows(InteractionSample, .id = "Sample")
+
+    return(InteractionRepl)
+    
+  })
+
+names(InteractionPair) <- paste0(DF.Interaction$Ligand, "_", DF.Interaction$Receptor)
+
+```
+
+# Filter low expressed interactions
+```{r}
+
+InteractionFiltered <- 
+lapply(InteractionPair, function(x) {
+  
+   if(nrow(x)==0) 
+    { x <- NULL } else {
+    
+   if(max(x[, 4]) < 0.05 | max(x[, 5]) < 0.05) 
+    { x <- NULL }}
+  
+  return(x)
+  
+}) %>% purrr::compact() %>% length()
+
+DF.Interaction_filtered <- DF.Interaction[DF.Interaction$Merged %in% names(InteractionFiltered), ]
+
+```
+
+# Permutation cluster labels on filtered list
+Cluster label are permuted across all cells to generate the null distribution of each interaction. 
+```{r}
+
+InteractionPermut <- lapply(1:length(InteractionFiltered), function(z) {
+  
+  InteractionRepl <- lapply(c(1:30), function(y) {
+    
+    InteractionSample <- lapply(NewSobj, function(x) {
+      
+      Ligand <- DF.Interaction_filtered$Ligand[z]
+      Receptor <- DF.Interaction_filtered$Receptor[z]
+      
+      df <-  get.data(x, c(Ligand, Receptor)) %>% 
+        filter(!is.na(Population_Merge))
+      
+      df$Population_Merge <- sample(x=df$Population_Merge,
+                                    size=length(df$Population_Merge))
+
+      if(is.null(df[[Ligand]]) | is.null(df[[Receptor]]))
+        
+      { df <- NULL
+      
+      } else {
+        
+        df <- df[, c("Population_Merge", Ligand, Receptor)] 
+        
+        df <- df %>% group_by(Population_Merge) %>% 
+          summarise_all(., mean)
+        
+       Expr.Ligand <-  df %>% group_by(Cluster_L=Population_Merge) %>% 
+          .[, c("Cluster_L", colnames(df)[2])]
+        Expr.Receptor <- df %>% group_by(Cluster_R=Population_Merge) %>% 
+          .[, c("Cluster_R", colnames(df)[3])]
+        
+        grid <- expand.grid(Cluster_L=Expr.Ligand$Cluster_L, Cluster_R= Expr.Receptor$Cluster_R, 
+                            stringsAsFactors = FALSE)
+        
+        df <- left_join(grid, Expr.Ligand, by="Cluster_L") %>% 
+          left_join(., Expr.Receptor, by="Cluster_R") %>% 
+          mutate(Interaction=get(colnames(df)[2])*get(colnames(df)[3]))
+        
+      }
+      
+      return(df)
+      
+    })
+    
+    InteractionRepl <- bind_rows(InteractionSample, .id = "Sample")
+    
+    return(InteractionRepl)
+    
+  })
+ 
+  InteractionPermut <- bind_rows(InteractionRepl, .id = "Replicate")
+  return(InteractionPermut)
+
+})
+
+names(InteractionPermut) <- names(InteractionFiltered)
+
+```
+
+# How many of the permuted events are greater than the actual Interaction score
+```{r}
+
+Interaction_Counted <- lapply(1:length(InteractionPermut), function(z) {
+    
+  new_spl <-  lapply(1:12, function(y) {
+      
+      spl <- dplyr::filter(InteractionFiltered[[z]], Sample==names(NewSobj)[y], 
+                           Interaction > 0)
+      colnames(spl)[4:5] <- c("Ligand", "Receptor")
+      
+      if(nrow(spl)>0) 
+        {
+        perm <- dplyr::filter(InteractionPermut[[z]], Sample==names(NewSobj)[y]) %>% 
+          pull(Interaction)
+        
+        n_greater <-  sapply(spl$Interaction, function(x) 
+          {
+          n_greater <- sum(x <= perm, na.rm = T)
+          
+          return(n_greater)
+          })
+        
+        new_spl <- cbind(spl, n_greater, Length_Perm=length(perm)) %>% 
+          mutate(Proportion.nPerm = n_greater/Length_Perm)
+       }
+      
+       else { new_spl <- spl}
+      
+      return(new_spl)
+      
+      })
+  
+  return(bind_rows(new_spl))
+  
+  })
+     
+names(Interaction_Counted) <- names(InteractionFiltered)
+
+Int_complete <- bind_rows(Interaction_Counted, .id = "Name")
+
+```
+
+# Adjust p value
+```{r}
+
+Int_complete <- lapply(1:12, function(x) {
+   
+  y <- filter(Int_complete, Sample==unique(Int_complete$Sample)[x])
+  nrow(y)
+  y$p.adj <- p.adjust(y$Proportion.nPerm, method="BH")
+  
+  return(y)
+  }) %>% bind_rows()
+
+```
+
+# Filter data frame add some meta data
+```{r}
+
+Int_complete <- Int_complete %>%
+  mutate(Combination = paste(Cluster_L, Cluster_R),
+         Malignant = ifelse(grepl(Sample, pattern = "rLN"), "FALSE", "TRUE")) %>%
+  filter(!Combination %in% c("B hB", "hB B") & Cluster_R!=Cluster_L) %>%
+  group_by(Name) %>% 
+  mutate(Interaction_Norm = Interaction/max(Interaction)) %>% ungroup()
+
+Int_complete$Combination_complete <- NA
+Int_complete[Int_complete$Combination %in% c("TFH B", "TFH hB"), ]$Combination_complete <- "TFH~B"
+Int_complete[Int_complete$Combination %in% c("TREG B", "TREG hB"), ]$Combination_complete <- "TREG~B"
+Int_complete[Int_complete$Combination %in% c("TOX B", "TOX hB"), ]$Combination_complete <- "TOX~B"
+Int_complete[Int_complete$Combination %in% c("TH B", "TH hB"), ]$Combination_complete <- "TH~B"
+
+Int_complete[Int_complete$Combination %in% c("B TFH", "hB TFH"), ]$Combination_complete <- "B~TFH"
+Int_complete[Int_complete$Combination %in% c("B TREG", "hB TREG"), ]$Combination_complete <- "B~TREG"
+Int_complete[Int_complete$Combination %in% c("B TOX", "hB TOX"), ]$Combination_complete <- "B~TOX"
+Int_complete[Int_complete$Combination %in% c("B TH", "hB TH"), ]$Combination_complete <- "B~TH"
+
+```
+
+# Overview of interactions between T cells and malignant B cells
+Sample 1 will be excluded due to the lack of T cells
+```{r message=FALSE, fig.height=8}
+
+DF_mal <- filter(Int_complete, !Sample=="DLBCL1", !grepl(Combination, pattern = "hB"))
+
+# Fill up data frame with theoretically possible interactions
+d1 <- data.frame(expand.grid(Name=unique(DF_mal$Name),  
+                            Sample=unique(DF_mal$Sample), 
+                            Combination=unique(DF_mal$Combination)))
+
+DF_filled <- bind_rows(select(DF_mal, Name, Sample, Combination, p.adj, Interaction_Norm, Ligand, Receptor),
+  cbind(dplyr::setdiff(d1, select(DF_mal, Name, Sample, Combination)), p.adj=1, Interaction_Norm=0, 
+        Ligand=0, Receptor=0)) %>%
+    left_join(.,  DF_mal %>% select(Sample, Malignant) %>% distinct(), by="Sample") %>%
+    left_join(.,  DF_mal %>% select(Combination, Combination_complete) %>% distinct(), by="Combination")
+
+# Normalize Interaction score by Interaction type
+# Calculate combined p value derived from different samples based on fisher method
+
+DF_filled <- DF_filled %>% filter(Malignant==T, !grepl(Combination, pattern = "hB")) %>% 
+  group_by(Name, Combination) %>% 
+  summarise(n = n(),
+            p.fisher = fisher.method(t(data.frame(p.adj)), method = "fisher", p.corr = "none", 
+                                                zero.sub = 0.001)$p.adj,
+            Mean_Interaction = mean(Interaction_Norm),
+            Mean_Ligand = mean(Ligand),
+            Mean_Receptor = mean(Receptor)) %>% ungroup() %>%
+  mutate(p.fisher=p.adjust(p.fisher, method = "BH"))
+
+DF_filled[1:10, ]
+
+
+offset <- -2.75
+offset.label <- offset-0.75
+alpha.sep <- 0.35
+gp.label <- gpar(cex=0.9, fontface="bold")
+
+DF_filled %>% filter(p.fisher <= 0.01) %>% dplyr::count(Name) %>% pull(Name) %>% as.character()
+
+DF_filled <- DF_filled %>% filter(Name %in% y.axis) %>%
+  mutate(Name = factor(Name, levels=rev(y.axis)))
+
+ggplot(DF_filled, aes(x=Combination, y=Name, fill=Mean_Interaction, size=-log10(p.fisher+0.0001)))+
+  geom_rect(inherit.aes = F, xmin=4.4, xmax=4.6, ymin=-Inf, ymax=Inf, fill="gray95", alpha=alpha.sep)+
+  geom_rect(inherit.aes = F, xmin=8.4, xmax=8.6, ymin=-Inf, ymax=Inf, fill="gray95", alpha=alpha.sep)+
+  geom_rect(inherit.aes = F, xmin=12.4, xmax=12.6, ymin=-Inf, ymax=Inf, fill="gray95", alpha=alpha.sep)+
+  geom_rect(inherit.aes = F, xmin=16.4, xmax=16.6, ymin=-Inf, ymax=Inf, fill="gray95", alpha=alpha.sep)+
+  geom_point(shape=21, stroke=0.25)+
+  scale_fill_gradient2(low = "#377eb8", mid = "#ffff33", high = "#e41a1c", 
+                       limits=c(0, 0.25), midpoint = 0.125, na.value = "#fc8d59", name="Interaction")+
+  scale_size_continuous(labels=c("0", "1", "2", expression(phantom(x) >=3)), 
+                        breaks = c(0, 1, 2, 3), range=c(0.5, 2.5), name = "-log10(p value)")+
+  scale_x_discrete(labels=strsplit(sort(unique(DF_filled$Combination)), split = " ") %>% 
+                     lapply(., "[[", 2) %>% unlist())+
+  scale_y_discrete(labels=gsub(rev(y.axis), pattern = "_", replacement = " ~ "))+
+  annotation_custom(grob = textGrob(expression('B'[Malignant]), gp=gp.label), 
+                    xmin = 2.5, xmax = 2.5, ymin = offset.label, ymax = offset.label) +
+  annotation_custom(grob = textGrob(expression('T'[FH]), gp=gp.label), 
+                    xmin = 6.5, xmax = 6.5, ymin = offset.label, ymax = offset.label) +
+  annotation_custom(grob = textGrob(expression('T'[H]), gp=gp.label), 
+                    xmin = 10.5, xmax = 10.5, ymin = offset.label, ymax = offset.label) +
+  annotation_custom(grob = textGrob(expression('T'[TOX]), gp=gp.label), 
+                    xmin = 14.5, xmax = 14.5, ymin = offset.label, ymax = offset.label) +
+  annotation_custom(grob = textGrob(expression('T'[REG]), gp=gp.label), 
+                    xmin = 18.5, xmax = 18.5, ymin = offset.label, ymax = offset.label) +
+  annotation_custom(grob = linesGrob(), xmin = 0.9, xmax = 4.1, ymin = offset, ymax = offset) +
+  annotation_custom(grob = linesGrob(), xmin = 4.9, xmax = 8.1, ymin = offset, ymax = offset) +
+  annotation_custom(grob = linesGrob(), xmin = 8.9, xmax = 12.1, ymin = offset, ymax = offset) +
+  annotation_custom(grob = linesGrob(), xmin = 12.9, xmax = 16.1, ymin = offset, ymax = offset) +
+  annotation_custom(grob = linesGrob(), xmin = 16.9, xmax = 20.1, ymin = offset, ymax = offset) +
+  guides(fill=guide_colorbar(ticks.colour = "black"))+
+  theme_bw()+
+  coord_cartesian(clip="off")+
+  theme(axis.title = element_blank(),
+        legend.position = "right",
+        axis.text.x = element_text(angle=90, hjust=0, vjust = 0.5),
+        plot.margin = unit(c(1,1,3,1), "lines"),
+        axis.text = element_text(size=8))
+
+```
+
+# Session Info
+```{r}
+
+sessionInfo()
+
+
+```
+
