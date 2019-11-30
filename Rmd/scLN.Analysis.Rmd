@@ -1,0 +1,1970 @@
+---
+title: "scRNA-seq Analysis of lymph node derived B cell lymphoma samples"
+author: Roider Tobias, Sascha Dietrich
+date: "`r doc_date()`"
+output: 
+    BiocStyle::html_document:
+        toc: true
+        self_contained: true
+        toc_float: false
+        code_download: true
+        df_print: paged
+        toc_depth: 2
+        highlight: tango
+    BiocStyle::pdf_document:
+        toc: true
+        toc_depth: 2
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r options, include=FALSE, warning = FALSE}
+library(knitr)
+options(digits=3, width=80)
+golden_ratio <- (1 + sqrt(5)) / 2
+opts_chunk$set(echo=TRUE,tidy=FALSE,include=TRUE,
+               dev=c('png'), fig.height = 5, fig.width = 4 * golden_ratio, comment = '  ', dpi = 300,
+cache = TRUE, warning = FALSE)
+
+```
+
+ **LAST UPDATE AT**
+
+```{r, echo=FALSE, cache=FALSE, warning = FALSE}
+print(date())
+```
+
+This rmd file belongs to the __Manuscript__:  
+  
+_"Dissecting intratumor heterogeneity of nodal B cell lymphoma on the transcriptional, genetic, and drug response level"_  
+Roider _et al._  
+doi: ...  
+
+It summarizes the key analysis of single cell RNA sequencing data of lymph node derived B cell lymphoma samples. The majority of the analysis is based on the `r CRANpkg("Seurat")`, version 2.3.4. Other versions are not completely compatible with this code and require to modify some functions. 
+
+__Sample abbreviations:__  
+DLBCL: Diffuse large B cell lymphoma  
+tFL: Transformed follicular lymphoma  
+FL: Follicular lymphopma  
+rLN: Reactive lymph node
+
+# Load packages
+```{r Load packages, message=FALSE, warning = FALSE}
+
+library("Seurat")
+library("grid")
+library("tidyverse")
+library("readxl")
+library("Matrix")
+library("reshape2")
+library("matrixStats")
+library("purrr")
+library("viridis")
+library("RColorBrewer")
+library("lemon")
+library("ggrepel")
+library("ggpmisc")
+library("scales")
+library("ggbeeswarm")
+library("scater")
+library("scran")
+library("SingleCellExperiment")
+
+# Define some important functions which tend to make problems
+
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+arrange <- dplyr::arrange
+select <- dplyr::select
+
+```
+
+# Define functions
+## Seurat processing
+`doSeuratProc` function is a summary function for the recommended workflow of Seurat package for scRNA-Seq data.  
+It needs SeuratObjects created from raw count matrix, as well as clustering and t-SNE parameters.
+```{r}
+
+doSeuratProc <- function(Sobj, lowthresh, highthresh, highmito, regress.cc, plot=T, 
+                         ClustDims, r, tDims, perplexity=40) 
+{
+  # Readout proportion of mitochondrial genes 
+  mito.genes <- grep(pattern = "^MT-", 
+                     x = rownames(x = Sobj@data), value = T)
+  pc.mito <- Matrix::colSums(Sobj@raw.data[mito.genes, ])/
+   Matrix::colSums(Sobj@raw.data)
+  
+  # Readout proportion of ribosomal genes 
+  ribo.genes <- grep(pattern = "^RP", 
+                    x = rownames(x = Sobj@data), value = T)
+  pc.ribo <- Matrix::colSums(Sobj@raw.data[ribo.genes, ])/
+   Matrix::colSums(Sobj@raw.data)
+  
+  Sobj <- AddMetaData(Sobj, metadata = pc.mito, col.name = "pc.mito")
+  Sobj <- AddMetaData(Sobj, metadata = pc.ribo, col.name = "pc.ribo")
+  
+  par(mfrow = c(1, 2))
+   
+  GenePlot(object = Sobj, gene1 = "nUMI", gene2 = "pc.mito", cex.use = 0.1)
+  GenePlot(object = Sobj, gene1 = "nUMI", gene2 = "nGene", cex.use = 0.1)
+   
+  par(mfrow = c(1, 1))
+  
+  # Filter cells with exceedingly high or low number of genes and high percentage of mitochondrial genes
+  Sobj <- FilterCells(object = Sobj, subset.names = c("nGene", "pc.mito"), 
+                      low.thresholds = c(lowthresh, 0), 
+                      high.thresholds = c(highthresh, highmito))
+  
+  # Normalize function with default scale factor of 10000
+  Sobj <- NormalizeData(object = Sobj, normalization.method = "LogNormalize",  
+                        display.progress = F)
+  
+  # Identify variable genes
+  cat("Plotting dispersion versus average expression")
+  
+  Sobj <- FindVariableGenes(Sobj, mean.function = ExpMean, dispersion.function = LogVMR,
+                            x.low.cutoff = 0.1, x.high.cutoff = 3, y.cutoff = 0.5)
+  
+  if(regress.cc %in% c(1, 2)){
+    
+    # Assign and regress cell cycle
+    Sobj <- CellCycleScoring(Sobj, s.genes = s.genes, 
+                             g2m.genes = g2m.genes, set.ident = T)
+
+    ## Plot cell cycle of all cells 
+    ggplot(Sobj@meta.data, aes(x=G2M.Score, y=S.Score, color=Phase))+
+      geom_point()+theme_bw()
+    
+    if(regress.cc==1) {
+      
+      Sobj <- ScaleData(Sobj, display.progress = F, do.par = T, num.cores = 3,
+                        vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+      
+     }else{
+      
+      Sobj@meta.data$CC.Difference <- Sobj@meta.data$S.Score - Sobj@meta.data$G2M.Score
+      Sobj <- ScaleData(Sobj, display.progress = T, do.par = T, num.cores = 3,
+                        vars.to.regress = c("CC.Difference", "nUMI", "pc.mito"))
+    }
+    
+    ## cell cycle effects strongly mitigated in PCA
+    Sobj <- RunPCA(Sobj, pc.genes = c(s.genes, g2m.genes), 
+                   do.print = FALSE)
+    
+    PCAPlot(Sobj)
+    
+  }
+  
+  # Run principal component analysis
+  Sobj <- RunPCA(object = Sobj,
+                 pc.genes = Sobj@var.genes, do.print = TRUE,
+                 pcs.print = 1:5, genes.print = 10)
+  
+  # Looking at SD of PCs
+  PCElbowPlot(object = Sobj)
+  
+  # Perform shared nearest neighbor (SNN) clustering
+  Sobj <- FindClusters(Sobj, reduction.type = "pca",
+                       dims.use = ClustDims,  resolution = r, print.output = 0,
+                       save.SNN = TRUE, force.recalc = TRUE)
+  
+  # Perform T-distributed stochastic neighborhood embedding (t-SNE)
+  Sobj <- RunTSNE(Sobj, theta=0.5,
+                  dims.use = tDims, do.fast = TRUE, perplexity=perplexity)
+  
+  return(Sobj)
+  
+}
+
+```
+
+## Short Seurat processing
+`short.SeuratProc` function re-calculates only PCA, SNN-based clustering and t-SNE of subsetted objects.
+```{r}
+
+short.SeuratProc <- function(Sobj, ClustDims, r, tDims, perplexity) 
+
+  {
+  
+  # Run principal component analysis
+  Sobj <- RunPCA(Sobj,pc.genes = Sobj@var.genes, do.print = TRUE,
+                 pcs.print = 1:5, genes.print = 10)
+  
+  # Looking at SD of PCs
+  PCElbowPlot(object = Sobj)
+  
+  # Perform shared nearest neighbor (SNN) clustering
+  Sobj <- FindClusters(Sobj, reduction.type = "pca",
+                       dims.use = ClustDims,  resolution = r, print.output = 0,
+                       save.SNN = TRUE, force.recalc = TRUE)
+  
+  # Perform T-distributed stochastic neighborhood embedding (t-SNE)
+  Sobj <- RunTSNE(Sobj, theta=0.5,
+                  dims.use = tDims, do.fast = TRUE, perplexity=perplexity)
+  
+  return(Sobj)
+  
+}
+
+```
+
+
+## Extract data from Seurat objects
+`get.data` extracts most important meta data and feature data, and puts them into a data frame.
+```{r}
+
+get.data <- function(Sobj, genes) {
+  
+  # Extract Meta data
+  df.meta <- data.frame(Cluster = Sobj@ident, Sobj@meta.data)
+
+  # Extract tSNE coordinates if available
+  if(!is.null(Sobj@dr$tsne))
+    { 
+    df.meta <- cbind(df.meta, Sobj@dr$tsne@cell.embeddings) 
+    }
+  
+  # Extract tSNE coordinates if available
+  if(!is.null(Sobj@dr$umap))
+    { 
+    df.meta <- cbind(df.meta, Sobj@dr$umap@cell.embeddings) 
+    }
+
+  # Extract gene expression data for expressed genes
+  genes.red <- rownames(Sobj@data)[rownames(Sobj@data) %in% genes]
+  dftotal <-  cbind(df.meta, FetchData(Sobj, genes.red))
+  
+  return(dftotal)
+
+}
+
+```
+
+# Define paths
+```{r}
+
+# Read in a list of cell cycle markers, from Tirosh et al, 2015
+Path <- "/Users/tobiasroider/Google Drive/AG Dietrich/Single Cell Sequencing/Run3/Sonstiges/CellCycle_Seurat/regev_lab_cell_cycle_genes.txt"
+cc.genes <- readLines(con = Path)
+ 
+# This list is separated into markers of G2/M phase and markers of S phase
+s.genes <- cc.genes[1:43]
+g2m.genes <- cc.genes[44:97]
+
+# Set Path for raw count tables
+CountTables <- readRDS("/Users/tobiasroider/Google Drive/AG Dietrich/Publikationen/SCS.Run3.LN.2018/Analysis/Data/CountTables.R3+4.rds")
+
+```
+
+# scRNA-Seq workflow for each sample
+## DLBCL1
+```{r}
+
+DLBCL1 <- CreateSeuratObject(raw.data = CountTables$DLBCL1,
+                             min.cells = 3, min.genes = 200)
+
+DLBCL1 <- doSeuratProc(DLBCL1, highthresh=4000, lowthresh = 200, 
+                       highmito = 0.05, regress.cc = 1, plot=T,
+                       ClustDims = 1:14, r = 0.25, tDims = 1:15)
+
+TSNEPlot(DLBCL1, do.label = T, no.legend=T, coord.fixed=T)
+
+```
+
+## DLBCL2
+```{r}
+
+DLBCL2 <- CreateSeuratObject(raw.data = CountTables$DLBCL2,
+                             min.cells = 3, min.genes = 200)
+
+DLBCL2 <- doSeuratProc(DLBCL2, highthresh =3000, lowthresh = 200, 
+                       highmito = 0.05, regress.cc = 1, plot=T,
+                       ClustDims = 1:16, r = 0.4, tDims = 1:10)
+
+TSNEPlot(DLBCL2, do.label = T, no.legend=T, coord.fixed=T)
+
+```
+
+## DLBCL3
+```{r}
+
+DLBCL3 <- CreateSeuratObject(raw.data = CountTables$DLBCL3,
+                             min.cells = 3, min.genes = 200)
+
+DLBCL3 <- doSeuratProc(DLBCL3, highthresh = 5000, lowthresh = 200, 
+                       highmito = 0.05, regress.cc = 1, plot=T,
+                       ClustDims = 1:14, r = 0.4, tDims = 1:15)
+
+TSNEPlot(DLBCL3, do.label = T, no.legend=T, coord.fixed=T)
+
+
+```
+
+## tFL1
+```{r}
+
+tFL1 <- CreateSeuratObject(raw.data = CountTables$tFL1,
+                             min.cells = 3, min.genes = 200)
+
+tFL1 <- doSeuratProc(tFL1, highthresh=2500, lowthresh = 200, 
+                     highmito = 0.05, regress.cc = 1, plot=T,
+                     ClustDims = 1:12, r = 0.6, tDims = 1:14)
+
+TSNEPlot(tFL1, do.label = T, no.legend=T, coord.fixed=T)
+
+```
+
+## tFL2
+```{r}
+
+tFL2 <- CreateSeuratObject(raw.data = CountTables$tFL2,
+                             min.cells = 3, min.genes = 200)
+
+tFL2 <- doSeuratProc(tFL2, highthresh=2500, lowthresh = 600, 
+                     highmito = 0.05, regress.cc = 1, plot=T,
+                     ClustDims = 1:14, r = 0.4, tDims = 1:14)
+
+TSNEPlot(tFL2, do.label = T, no.legend=T, coord.fixed=T)
+
+```
+
+## FL1
+```{r }
+
+FL1 <- CreateSeuratObject(raw.data = CountTables$FL1,
+                          min.cells = 3, min.genes = 200)
+
+FL1 <- doSeuratProc(FL1, highthresh=2500, lowthresh = 200, 
+                    highmito = 0.05, regress.cc = 1, plot=T, 
+                    ClustDims = 1:10, r = 0.4, tDims = 1:18)
+
+TSNEPlot(FL1, do.label = T, no.legend=T, coord.fixed=T)
+
+```
+
+## FL2
+```{r }
+
+FL2 <- CreateSeuratObject(raw.data = CountTables$FL2,
+                          min.cells = 3, min.genes = 200)
+
+FL2 <- doSeuratProc(FL2, highthresh=2500, lowthresh = 200, 
+                    highmito = 0.05, regress.cc = 1, plot=T, 
+                    ClustDims = 1:14, r = 0.4, tDims = 1:15)
+
+TSNEPlot(FL2, do.label = T, no.legend=T, coord.fixed=T)
+
+```
+
+## FL3
+```{r Sample 1: Untreated BM, message=FALSE, warning=FALSE}
+
+FL3 <- CreateSeuratObject(raw.data = CountTables$FL3,
+                          min.cells = 3, min.genes = 200)
+
+FL3 <- doSeuratProc(FL3, highthresh=2000, lowthresh = 200, 
+                    highmito = 0.05, regress.cc = 1, plot=T, 
+                    ClustDims = 1:16, r = 0.4, tDims = 1:19, perplexity = 50)
+
+TSNEPlot(FL3, do.label = T, no.legend=T, coord.fixed=T)
+
+```
+
+## FL4
+```{r}
+
+FL4 <- CreateSeuratObject(raw.data = CountTables$FL4,
+                             min.cells = 3, min.genes = 200)
+
+FL4 <- doSeuratProc(FL4, highthresh =2500, lowthresh = 600, 
+                       highmito = 0.05, regress.cc = 1, plot=T,
+                       ClustDims = 1:18, r = 0.5, tDims = 1:15)
+
+TSNEPlot(FL4, do.label = T, no.legend=T, coord.fixed=T)
+
+```
+
+## rLN1
+```{r Sample 1: Untreated BM, message=FALSE, warning=FALSE}
+
+rLN1 <- CreateSeuratObject(raw.data = CountTables$rLN1,
+                          min.cells = 3, min.genes = 200)
+
+rLN1 <- doSeuratProc(rLN1, highthresh=2500, lowthresh = 200, 
+                    highmito = 0.05, regress.cc = 1, plot=T, 
+                    ClustDims = 1:15, r = 0.5, tDims = 1:20)
+
+TSNEPlot(rLN1, do.label = T, no.legend=T, coord.fixed=T)
+
+```
+
+## rLN2
+```{r}
+
+
+rLN2 <- CreateSeuratObject(raw.data = CountTables$rLN2,
+                             min.cells = 3, min.genes = 200)
+
+rLN2 <- doSeuratProc(rLN2, highthresh =2500, lowthresh = 200, 
+                     highmito = 0.05, regress.cc = 1, plot=T,
+                     ClustDims = 1:14, r = 0.4, tDims = 1:15)
+
+TSNEPlot(rLN2, do.label = T, no.legend=T, coord.fixed=T)
+
+```
+
+## rLN3
+```{r}
+
+rLN3 <- CreateSeuratObject(raw.data = CountTables$rLN3,
+                             min.cells = 3, min.genes = 200)
+
+rLN3 <- doSeuratProc(rLN3, highthresh =3000, lowthresh = 200, 
+                     highmito = 0.05, regress.cc = 1, plot=T,
+                     ClustDims = 1:14, r = 0.4, tDims = 1:15)
+
+TSNEPlot(rLN3, do.label = T, no.legend=T, coord.fixed=T)
+
+```
+
+# Identify B, T and myeloid cells
+## Put SeuratObjects in a list
+```{r}
+
+sobj <- 
+  list(DLBCL1, DLBCL2, DLBCL3, tFL1, tFL2, 
+       FL1, FL2, FL3, FL4, rLN1, rLN2, rLN3)
+
+names(sobj) <- 
+  c("DLBCL1", "DLBCL2", "DLBCL3", "tFL1", "tFL2", 
+    "FL1", "FL2", "FL3", "FL4", "rLN1", "rLN2", "rLN3")
+
+rm(DLBCL1, DLBCL2, DLBCL3, tFL1, tFL2, 
+   FL1, FL2, FL3, FL4, rLN1, rLN2, rLN3,
+   CountTables)
+
+```
+
+## Extract main markers from SeuratObjects
+```{r}
+
+CommonMarkers <- c("CD79A", "CD79B", "MS4A1", "CD3E", "NKG7",  
+                   "LYZ", "CST3", "GNLY", "JCHAIN")
+
+DF <- lapply(seq(1, length(sobj), 1), function(x) {
+  
+  df <- get.data(sobj[[x]], genes=CommonMarkers)
+  
+  df$Sample <- names(sobj)[x]
+  
+  return(df)
+  
+})
+
+names(DF) <- names(sobj)
+```
+
+## Plots for basic cell type identification
+These Markers were mainly used to identify the different clusters as certain cell types.  
+B cells: CD79A/B, MS4A1
+T cells: CD3, CD19 negative
+NK cells: NGK7, GNLY, negative for CD3D/E 
+Monocytes: CST3, LYZ  
+Dendritic cells: JCHAIN  
+
+```{r Identify populations: S1, message=FALSE, warning=FALSE}
+
+for (n in 1:length(DF)) {
+
+Plotlist <- list()
+
+cat(paste("Plotting markers for", names(DF)[n]))
+
+for (m in 1:length(CommonMarkers)){
+  
+Plotlist[[rep(1:4, 6)[m]]] <- ggplot()+
+  geom_point(data=DF[[n]], 
+             aes_string(x="tSNE_1", y="tSNE_2", color=CommonMarkers[m]), 
+             size=0.15, alpha=0.75)+
+  scale_color_gradient(low = "#fee8c8", high="#e34a33", name="Expr")+
+  theme_bw()+
+  xlim(-45, 45)+ylim(-45, 45)+
+  xlab("tSNE1")+ylab("tSNE2")+ 
+  coord_fixed()+
+  ggtitle(CommonMarkers[m])+
+  theme(legend.key.size = unit(0.15, "cm"),
+        legend.position = c(0.88, 0.18),
+        legend.title = element_text(size=4),
+        legend.text = element_text(size=4),
+        plot.title = element_text(hjust = 0.5, size=8),
+        axis.title = element_blank(),
+        axis.text = element_text(size=6))
+
+if(m %in% seq(4, 21, 4)){
+  
+plot_grid(Plotlist[[1]], Plotlist[[2]], 
+          Plotlist[[3]], Plotlist[[4]], 
+          ncol = 2, nrow = 2) %>% print()
+}
+
+}
+
+}
+
+```
+
+## Assigning major cell types
+Based on the information above, major cell populations (myeloid cells, T cells and B cells) are labeled in the following chunk. The resulting percentages are plotted in the stacked bar graph below. 
+```{r Assigning major cell types, message=FALSE, warning=FALSE}
+
+# DLBCL1
+sobj$DLBCL1@meta.data$Population <- NA
+sobj$DLBCL1@meta.data[WhichCells(sobj$DLBCL1, ident = c(0, 1)), ]$Population <- "B"
+sobj$DLBCL1@meta.data[WhichCells(sobj$DLBCL1, ident = c(2)), ]$Population <- "T"
+
+# DLBCL2
+sobj$DLBCL2@meta.data$Population <- NA
+sobj$DLBCL2@meta.data[WhichCells(sobj$DLBCL2, ident = c(0, 1, 2, 3)), ]$Population <- "B"
+sobj$DLBCL2@meta.data[WhichCells(sobj$DLBCL2, ident = c(4, 5)), ]$Population <- "T"
+sobj$DLBCL2@meta.data[WhichCells(sobj$DLBCL2, ident = c(6)), ]$Population <- "M"
+
+# DLBCL3
+sobj$DLBCL3@meta.data$Population <- NA
+sobj$DLBCL3@meta.data[WhichCells(sobj$DLBCL3, ident = c(0, 1, 4)), ]$Population <- "B"
+sobj$DLBCL3@meta.data[WhichCells(sobj$DLBCL3, ident = c(2, 3)), ]$Population <- "T"
+sobj$DLBCL3@meta.data[WhichCells(sobj$DLBCL3, ident = c(5)), ]$Population <- "M"
+
+# tFL1
+sobj$tFL1@meta.data$Population <- NA
+sobj$tFL1@meta.data[WhichCells(sobj$tFL1, ident = c(1, 3, 6)), ]$Population <- "B"
+sobj$tFL1@meta.data[WhichCells(sobj$tFL1, ident = c(0, 2, 4, 5)), ]$Population <- "T"
+sobj$tFL1@meta.data[WhichCells(sobj$tFL1, ident = c(7)), ]$Population <- "M"
+
+# tFL2
+sobj$tFL2@meta.data$Population <- NA
+sobj$tFL2@meta.data[WhichCells(sobj$tFL2, ident = c(0, 1, 4)), ]$Population <- "B"
+sobj$tFL2@meta.data[WhichCells(sobj$tFL2, ident = c(2, 3)), ]$Population <- "T"
+
+# FL1
+sobj$FL1@meta.data$Population <- NA
+sobj$FL1@meta.data[WhichCells(sobj$FL1, ident = c(0, 2, 5, 6)), ]$Population <- "B"
+sobj$FL1@meta.data[WhichCells(sobj$FL1, ident = c(1, 3, 4)), ]$Population <- "T"
+
+# FL2
+sobj$FL2@meta.data$Population <- NA
+sobj$FL2@meta.data[WhichCells(sobj$FL2, ident = c(0, 1)), ]$Population <- "B"
+sobj$FL2@meta.data[WhichCells(sobj$FL2, ident = c(2, 3)), ]$Population <- "T"
+
+# FL3
+sobj$FL3@meta.data$Population <- NA
+sobj$FL3@meta.data[WhichCells(sobj$FL3, ident = c(0, 1, 4, 5)), ]$Population <- "B"
+sobj$FL3@meta.data[WhichCells(sobj$FL3, ident = c(2, 3)), ]$Population <- "T"
+sobj$FL3@meta.data[WhichCells(sobj$FL3, ident = c(6)), ]$Population <- "M"
+
+# FL4
+sobj$FL4@meta.data$Population <- NA
+sobj$FL4@meta.data[WhichCells(sobj$FL4, ident = c(0, 1, 2, 5, 6)), ]$Population <- "B"
+sobj$FL4@meta.data[WhichCells(sobj$FL4, ident = c(3, 4)), ]$Population <- "T"
+
+# rLN1
+sobj$rLN1@meta.data$Population <- NA
+sobj$rLN1@meta.data[WhichCells(sobj$rLN1, ident = c(2, 4)), ]$Population <- "B"
+sobj$rLN1@meta.data[WhichCells(sobj$rLN1, ident = c(0, 1, 3, 5, 6)), ]$Population <- "T"
+sobj$rLN1@meta.data[WhichCells(sobj$rLN1, ident = c(7, 8)), ]$Population <- "M"
+
+# rLN2
+sobj$rLN2@meta.data$Population <- NA
+sobj$rLN2@meta.data[WhichCells(sobj$rLN2, ident = c(0, 1, 3)), ]$Population <- "B"
+sobj$rLN2@meta.data[WhichCells(sobj$rLN2, ident = c(2, 4)), ]$Population <- "T"
+sobj$rLN2@meta.data[WhichCells(sobj$rLN2, ident = c(6)), ]$Population <- "M"
+# Cells of cluster 5 will no be annotated because of an extreme nUMI Count (see plots above)
+# Might be Doublets
+
+# rLN3
+sobj$rLN3@meta.data$Population <- NA
+sobj$rLN3@meta.data[WhichCells(sobj$rLN3, ident = c(0, 2, 6)), ]$Population <- "B"
+sobj$rLN3@meta.data[WhichCells(sobj$rLN3, ident = c(1, 3, 4, 5)), ]$Population <- "T"
+sobj$rLN3@meta.data[WhichCells(sobj$rLN3, ident = c(7)), ]$Population <- "M"
+
+```
+
+Update DF
+```{r}
+
+DF <- lapply(seq(1, length(sobj), 1), function(x) {
+  
+  df <- get.data(sobj[[x]], genes=CommonMarkers)
+  
+  df$Sample <- names(sobj)[x]
+  
+  return(df)
+  
+  
+})
+```
+
+# Proliferation
+G2M Score is calculated using the `CellCycleScoring` function. This function uses gene list from Tirosh et al. (Science 2016)
+```{r}
+
+# B cells
+bind_rows(DF) %>% select(-contains("res")) %>% filter(Population=="B") %>% 
+  ggplot(aes(S.Score, G2M.Score))+
+  geom_point(size=0.75, stroke=0.25, alpha=0.5, color="#2171b5")+
+  facet_wrap(~Sample)+
+  guides(fill = guide_legend(override.aes = list(size = 2))) +
+  theme_bw()
+
+# T cells
+bind_rows(DF) %>% select(-contains("res")) %>% filter(Population=="T") %>% 
+  ggplot(aes(S.Score, G2M.Score))+
+  geom_point(size=0.75, stroke=0.25, alpha=0.5, color="#238b45")+
+  facet_wrap(~Sample)+
+  guides(fill = guide_legend(override.aes = list(size = 2))) +
+  theme_bw()
+
+```
+
+# Analysis of B cells
+## Run scRNA-Seq workflow on B cells only
+```{r}
+
+sobj.B <- lapply(sobj, function(x) { 
+  
+   x <- SubsetData(object=x, subset.name = "Population", accept.value = "B", 
+                  subset.raw = T, do.clean = F)
+
+  return(x)
+  
+  })
+
+Markers <- list()
+top <- list()
+
+
+```
+
+### DLBCL1
+#### tSNE
+```{r}
+
+TSNEPlot(sobj.B$DLBCL1, do.label = T, no.legend=T)
+
+```
+
+#### DE genes
+```{r}
+
+Markers$DLBCL1 <- FindAllMarkers(sobj.B$DLBCL1, logfc.threshold = 0.25, only.pos = T)
+
+top$DLBCL1 <- Markers$DLBCL1 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% arrange(cluster) %>% 
+  pull(gene)
+
+DoHeatmap(sobj.B$DLBCL1, genes.use = top$DLBCL1, cex.col = 0, group.spacing = 0.25)
+
+Markers$DLBCL1 %>% filter(p_val_adj < 0.05)
+
+```
+
+### DLBCL2
+#### tSNE
+```{r}
+
+sobj.B$DLBCL2 <- short.SeuratProc(sobj.B$DLBCL2, ClustDims = 1:10, tDims = 1:12, 
+                                  r=0.4, perplexity = 40)
+
+TSNEPlot(sobj.B$DLBCL2, do.label = T, no.legend=T)
+
+sobj.B$DLBCL2 <- ScaleData(sobj.B$DLBCL2, display.progress = T, do.par = T, num.cores = 3,
+                    vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+```
+
+#### DE genes
+```{r}
+
+Markers$DLBCL2 <- FindAllMarkers(sobj.B$DLBCL2, logfc.threshold = 0.25, only.pos = T)
+
+top$DLBCL2 <- Markers$DLBCL2 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.B$DLBCL2, genes.use = top$DLBCL2, slim.col.label = T, group.spacing = 0.25)
+
+Markers$DLBCL2 %>% filter(p_val_adj<0.05)
+
+```
+
+### DLBCL3
+#### tSNE
+```{r}
+
+# Scaling after subsetting sometimes improvoves clustering and tSNE results
+sobj.B$DLBCL3 <- ScaleData(sobj.B$DLBCL3, display.progress = T, do.par = T, num.cores = 3,
+                 vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+sobj.B$DLBCL3 <- short.SeuratProc(sobj.B$DLBCL3, ClustDims = 1:13, tDims = 1:12, 
+                                  r=0.5, perplexity = 50)
+
+TSNEPlot(sobj.B$DLBCL3, do.label = T, no.legend=T)
+
+```
+
+#### DE genes
+```{r}
+
+Markers$DLBCL3 <- FindAllMarkers(sobj.B$DLBCL3, logfc.threshold = 0.25, only.pos = T)
+
+top$DLBCL3 <- Markers$DLBCL3 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) #%>% pull(gene)
+
+DoHeatmap(sobj.B$DLBCL3, genes.use = top$DLBCL3, slim.col.label = T, group.spacing = 0.25)
+
+Markers$DLBCL3%>% filter(p_val_adj < 0.05)
+
+```
+
+### tFL1
+#### tSNE
+```{r}
+
+# Rerun tSNE to rearrange cells in tsne plot
+sobj.B$tFL1 <- RunTSNE(sobj.B$tFL1, theta=0.5, dims.use = 1:19, do.fast = TRUE, perplexity=20)
+
+TSNEPlot(sobj.B$tFL1, do.label = T, no.legend=T)
+
+# Sscaling improves interpretation of heatmap
+sobj.B$tFL1 <- ScaleData(sobj.B$tFL1, display.progress = F, do.par = T, num.cores = 3,
+                         vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+
+```
+
+#### DE genes
+```{r}
+
+Markers$tFL1 <- FindAllMarkers(sobj.B$tFL1, logfc.threshold = 0.25, only.pos = T)
+
+top$tFL1 <- Markers$tFL1 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% arrange(cluster)#  %>% pull(gene)
+
+DoHeatmap(sobj.B$tFL1, genes.use = top$tFL1, slim.col.label = T, group.spacing = 0.25)
+
+Markers$tFL1 %>% filter(p_val_adj < 0.05)
+
+```
+
+### tFL2
+#### tSNE
+```{r}
+
+sobj.B$tFL2 <- short.SeuratProc(sobj.B$tFL2, ClustDims = 1:10, tDims = 1:15, 
+                                r=0.5, perplexity = 40)
+
+TSNEPlot(sobj.B$tFL2, do.label = T, no.legend=T)
+
+# Scaling improves interpretation of heatmap
+sobj.B$tFL2 <- ScaleData(sobj.B$tFL2, display.progress = F, do.par = T, num.cores = 3,
+                         vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+```
+
+#### DE genes
+```{r}
+
+Markers$tFL2 <- FindAllMarkers(sobj.B$tFL2, logfc.threshold = 0.25, only.pos = T)
+
+top$tFL2 <- Markers$tFL2 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.B$tFL2, genes.use = top$tFL2, slim.col.label = T, group.spacing = 0.25)
+
+Markers$tFL2 %>% filter(p_val_adj < 0.05)
+
+```
+
+### FL1
+#### tSNE
+```{r}
+
+sobj.B$FL1 <- ScaleData(sobj.B$FL1, display.progress = F, do.par = T, num.cores = 3,
+                 vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+sobj.B$FL1 <- short.SeuratProc(sobj.B$FL1, ClustDims = 1:10, tDims = 1:12, 
+                                  r=0.4, perplexity = 50)
+
+TSNEPlot(sobj.B$FL1, do.label = T, no.legend=T)
+
+# Cluster 5 contains remaining T cells, thereby we remove them and repeat analysis
+FeaturePlot(sobj.B$FL1, features.plot = c("CD79A", "CD3D"))
+
+sobj.B$FL1 <- SubsetData(sobj.B$FL1, ident.remove = 5)
+
+sobj.B$FL1 <- ScaleData(sobj.B$FL1, display.progress = F, do.par = T, num.cores = 3,
+                        vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+sobj.B$FL1 <- short.SeuratProc(sobj.B$FL1, ClustDims = 1:10, tDims = 1:12, 
+                                r=0.35, perplexity = 40)
+
+TSNEPlot(sobj.B$FL1, do.label = T, no.legend=T)
+
+
+```
+
+#### DE genes
+```{r}
+
+Markers$FL1 <- FindAllMarkers(sobj.B$FL1, logfc.threshold = 0.25, only.pos = T)
+
+top$FL1 <- Markers$FL1 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.B$FL1, genes.use = top$FL1, slim.col.label = T, group.spacing = 0.25)
+
+Markers$FL1 %>% filter(p_val_adj < 0.05)
+
+```
+
+### FL2
+#### tSNE
+```{r}
+
+sobj.B$FL2 <- ScaleData(sobj.B$FL2, vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"), 
+                  do.par = T, num.cores = 3)
+
+sobj.B$FL2 <- short.SeuratProc(sobj.B$FL2, ClustDims = 1:10, tDims = 1:12, 
+                               r=0.4, perplexity = 50)
+
+TSNEPlot(sobj.B$FL2, do.label = T, no.legend=T)
+
+# Cluster 4 contains remaining T cells, thereby we remove them and repeat analysis
+FeaturePlot(sobj.B$FL2, features.plot = c("CD79A", "CD3D"))
+
+sobj.B$FL2 <- SubsetData(sobj.B$FL2, ident.remove = 4) 
+
+sobj.B$FL2 <- short.SeuratProc(sobj.B$FL2, ClustDims = 1:10, tDims = 1:15, r=0.4, perplexity = 40)
+
+TSNEPlot(sobj.B$FL2, do.label = T, no.legend=T)
+
+```
+
+#### DE genes
+```{r}
+
+Markers$FL2 <- FindAllMarkers(sobj.B$FL2, logfc.threshold = 0.25, only.pos = T)
+
+top$FL2 <- Markers$FL2 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% arrange(cluster) #%>% pull(gene)
+
+DoHeatmap(sobj.B$FL2, genes.use = top$FL2, slim.col.label = T, group.spacing = 0.25)
+
+Markers$FL2 %>% filter(p_val_adj < 0.05)
+
+```
+
+### FL3
+#### tSNE
+```{r}
+
+sobj.B$FL3 <- ScaleData(sobj.B$FL3, vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"), 
+                  do.par = T, num.cores = 3)
+
+sobj.B$FL3 <- short.SeuratProc(sobj.B$FL3, ClustDims = 1:10, tDims = 1:12, 
+                                  r=0.4, perplexity = 50)
+
+TSNEPlot(sobj.B$FL3, do.label = T, no.legend=T)
+
+# Cluster 5 contains remaining T cells, thereby we remove them and repeat analysis
+FeaturePlot(sobj.B$FL3, features.plot = c("CD79A", "CD3D"))
+
+sobj.B$FL3 <- SubsetData(sobj.B$FL3, ident.remove = 5)
+
+sobj.B$FL3 <- ScaleData(sobj.B$FL3, display.progress = F, do.par = T, num.cores = 3,
+                        vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+sobj.B$FL3 <- short.SeuratProc(sobj.B$FL3, ClustDims = 1:12, tDims = 1:16, 
+                                r=0.4, perplexity = 40)
+
+TSNEPlot(sobj.B$FL3, do.label = T, no.legend=T)
+
+```
+
+#### DE genes
+```{r}
+
+Markers$FL3 <- FindAllMarkers(sobj.B$FL3, logfc.threshold = 0.25, only.pos = T)
+
+top$FL3 <- Markers$FL3 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% arrange(cluster) #%>% pull(gene)
+
+DoHeatmap(test, genes.use = top$FL3, slim.col.label = T, group.spacing = 0.25)
+
+Markers$FL3 %>% filter(p_val_adj < 0.05)
+
+```
+
+### FL4
+#### tSNE
+```{r}
+
+sobj.B$FL4 <- short.SeuratProc(sobj.B$FL4, ClustDims = 1:10, tDims = 1:12, 
+                                  r=0.4, perplexity = 50)
+
+TSNEPlot(sobj.B$FL4, do.label = T, no.legend=T)
+
+```
+
+#### DE genes
+```{r}
+
+Markers$FL4 <- FindAllMarkers(sobj.B$FL4, logfc.threshold = 0.25, only.pos = T)
+
+top$FL4 <- Markers$FL4 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.B$FL4, genes.use = c("CD27", "SELL", "CD24", "CD22", "CD69", "IGLC2", "IGKC"), slim.col.label = T, 
+          group.spacing = 0.25, use.scaled = F)
+
+Markers$FL4 %>% filter(p_val_adj < 0.05)
+
+```
+
+### rLN1
+#### tSNE
+```{r}
+
+sobj.B$rLN1 <- short.SeuratProc(sobj.B$rLN1, ClustDims = 1:10, tDims = 1:12, 
+                                r=0.4, perplexity = 50)
+
+TSNEPlot(sobj.B$rLN1, do.label = T, no.legend=T)
+
+```
+
+#### DE genes
+```{r}
+
+Markers$rLN1 <- FindAllMarkers(sobj.B$rLN1, logfc.threshold = 0.25, only.pos = T)
+
+top$rLN1 <- Markers$rLN1 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.B$rLN1, genes.use = top$rLN1, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers$rLN1 %>% filter(p_val_adj < 0.05)
+
+
+```
+
+### rLN2
+#### tSNE
+```{r}
+
+sobj.B$rLN2 <- short.SeuratProc(sobj.B$rLN2, ClustDims = 1:10, tDims = 1:12, 
+                                r=0.4, perplexity = 50)
+
+TSNEPlot(sobj.B$rLN2, do.label = T, no.legend=T)
+
+```
+
+#### DE genes
+```{r}
+
+Markers$rLN2 <- FindAllMarkers(sobj.B$rLN2, logfc.threshold = 0.25, only.pos = T)
+
+top$rLN2 <- Markers$rLN2 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.B$rLN2, genes.use = top$rLN2, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers$rLN2 %>% filter(p_val_adj < 0.05)
+
+```
+
+### rLN3
+#### tSNE
+```{r}
+
+sobj.B$rLN3 <- short.SeuratProc(sobj.B$rLN3, ClustDims = 1:10, tDims = 1:12, 
+                                r=0.4, perplexity = 50)
+
+TSNEPlot(sobj.B$rLN3, do.label = T, no.legend=T)
+
+
+```
+
+#### DE genes
+```{r}
+
+Markers$rLN3 <- FindAllMarkers(sobj.B$rLN3, logfc.threshold = 0.25, only.pos = T)
+
+top$rLN3 <- Markers$rLN3 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.B$rLN3, genes.use = top$rLN3, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers$rLN3 %>% filter(p_val_adj < 0.05)
+
+```
+
+
+## Extract main markers from B cell SeuratObjects
+```{r}
+
+# Update Markers
+CommonMarkers <- c("CD79A", "CD79B", "MS4A1", "CD3E", "CD8A", "CD4", 
+                   "NKG7",  "LYZ", "CST3", "GNLY", "JCHAIN", "IGLC2", "IGKC")
+
+DF.B <- lapply(sobj.B, function(x) {
+  
+  df <- get.data(x, genes=CommonMarkers)
+  
+  if(!"IGKC" %in% colnames(df)) { df <- mutate(df, IGKC=0)}
+  if(!"IGLC2" %in% colnames(df)) { df <- mutate(df, IGLC2=0)}
+  
+   # To avoid overplotting, ratios of 1 are jittered with a negativ value,
+   # whereas values of 0 are jittered with a positive value.
+  
+   df <- df %>% mutate(Ratio.jittered = ifelse(IGKC/(IGLC2+IGKC) == 1, 
+                       IGKC/(IGLC2+IGKC) - runif( n(), 0, 0.2 ), 
+                       ifelse(IGKC/(IGLC2+IGKC) == 0, 
+                       IGKC/(IGLC2+IGKC) + runif( n(), 0, 0.2 ), IGKC/(IGLC2+IGKC))))
+  
+  return(df)
+  
+  }
+  )
+
+```
+
+## Kappa/Lambda Plots
+Plotting the ratio between kappa and lambda light chain on RNA level nicely enables us to identify light chain restricted malignant cell populations. Light chain expression in non-malignant cells results in a plot which is blue/red scattered. Single-colored clusters indicate light chain restricted, therefore malignant cells. 
+
+```{r Kappa/Lambda ratio Plots, message=FALSE, warning=FALSE}
+
+plot.KL <- function(df){
+  
+p1 <- ggplot()+
+  geom_point(data=df, 
+             aes(x=tSNE_1, y=tSNE_2, color=Cluster),
+             size=0.5, alpha=0.75)+
+  theme_bw()+
+  guides(color = guide_legend(override.aes = list(size = 2))) +
+  xlab("tSNE1")+ylab("tSNE2")
+  
+  
+p2 <- ggplot(df)+
+  geom_rect(aes(xmin=-Inf, xmax=+Inf, ymin=-0.30, max=0.30), fill="grey95", alpha=0.05)+
+  geom_rect(aes(xmin=-0.30, xmax=0.30, ymin=-Inf, max=Inf), fill="grey95", alpha=0.05)+
+  geom_jitter(size=0.75, aes(x=IGKC, y=IGLC2, color=Cluster), height = 0.25, width = 0.25)+
+  ylim(c(-0.5, 7.5))+
+  xlim(c(-0.5, 7.5))+
+  theme_bw()+
+  guides(color = guide_legend(override.aes = list(size = 2))) +
+  theme(axis.title = element_text(face="italic"))
+  
+p3 <- ggplot()+
+  geom_point(data=df, 
+             aes(x=tSNE_1, y=tSNE_2, color=(IGLC2+0.001)/(IGKC+IGLC2+0.001)), 
+             size=0.75, alpha=0.75)+
+  scale_color_gradient2(low = "#91bfdb", mid="#ffffbf", limits=c(0, 1),
+                        midpoint = 0.5, high = "#fc8d59", name="K/L ratio", guide = "none")+
+  theme_bw()+
+  xlab("tSNE1")+ylab("tSNE2")
+
+p4 <- ggplot()+
+  geom_jitter(data=df, size=0.75, aes(x=Cluster, y=Ratio.jittered, 
+              color=Ratio.jittered), width = 0.25)+
+  scale_color_gradient2(low="#f46d43", mid = "#ffffbf", high = "steelblue2", midpoint = 0.5, 
+                         na.value = "#fc8d59", guide = "none")+
+  ylim(c(0, 1))+
+  ylab(expression(italic(IGKC/(IGLC2+IGKC))))+
+  geom_hline(yintercept = 0.5, linetype="dashed")+
+  theme_bw()
+  theme(axis.text.y = element_text(size=11), 
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(size=12, angle=45, hjust = 1))
+
+
+plot_grid(p1, p3, p2, p4, align = "v", axis = "left", rel_widths = c(1.2, 1))
+
+}
+
+lapply(DF.B, plot.KL)
+
+```
+
+## In depth analysis of individual samples
+### DLBCL1
+```{r}
+
+# Identify differentially expressed markers
+Markers.DLBCL1.B <- 
+  FindAllMarkers(sobj.B$DLBCL1, logfc.threshold = 0.25,
+                 test.use = "wilcox", only.pos = T) %>% 
+  filter(p_val_adj < 0.05)
+
+# Check markers of your interest
+Markers.DLBCL1.B
+
+# Calculate difference in expression
+Markers.DLBCL1.B$Diff <- Markers.DLBCL1.B$pct.1-Markers.DLBCL1.B$pct.2
+
+# Pick top 20 differentially expressed markers
+Top.DLBCL1.B <- Markers.DLBCL1.B %>% 
+  group_by(cluster) %>% 
+  top_n(20, Diff) %>% 
+  pull(gene) %>% 
+  unique()
+
+# Extract annotation data
+dfAnnotation <- data.frame(Cluster=sobj.B$DLBCL1@ident) %>% 
+  rownames_to_column(var = "Barcode") %>% 
+  arrange(Cluster) %>% 
+  column_to_rownames(var = "Barcode")
+
+# Extract expression data
+Matrix <- sobj.B$DLBCL1@data[Top.DLBCL1.B, rownames(dfAnnotation)] %>% as.matrix()
+
+# Sort genes by expression
+n1 <- Matrix[Top.DLBCL1.B[1:20], WhichCells(sobj.B$DLBCL1, ident = 0)] %>% 
+  rowMeans() %>% 
+  dplyr::desc() %>% 
+  sort() %>% 
+  names
+
+n2 <- Matrix[Top.DLBCL1.B[21:40], WhichCells(sobj.B$DLBCL1, ident = 1)] %>% 
+  rowMeans() %>% 
+  dplyr::desc() %>% 
+  sort() %>% 
+  names
+
+# Arrange Matrix by the order defined above
+Matrix <- Matrix[c(n1, rev(n2)),  ]
+
+# Scale Matrix by the Maximum of each row
+Matrix <- Matrix/rowMaxs(Matrix)
+
+# Heatmap
+pheatmap::pheatmap(Matrix, 
+                   annotation_col = dfAnnotation, 
+                   annotation_colors = list(Cluster = c("0"="#4daf4a", "1"="#7570b3")),
+                   show_colnames=F, 
+                   cluster_cols = F, 
+                   cluster_rows = F,
+                   fontsize_row = 7, 
+                   gaps_col = table(dfAnnotation)[1],
+                   gaps_row = 20,
+                   color=inferno(10), 
+                   breaks = seq(0, 1, length.out=10), 
+                   na_col = "#440154FF",
+                   annotation_legend = F
+                   )
+
+```
+
+### tFL1
+```{r}
+
+# Identify differentially expressed markers
+Markers.tFL1.B <- 
+  FindAllMarkers(sobj.B$tFL1, logfc.threshold = 0.25,
+                 test.use = "wilcox", only.pos = T) %>% 
+  filter(p_val_adj < 0.05)
+
+# Check markers of your interest
+Markers.tFL1.B
+
+# Calculate difference in expression
+Markers.tFL1.B$Diff <- Markers.tFL1.B$pct.1-Markers.tFL1.B$pct.2
+
+# Pick top 20 differentially expressed markers
+Top.tFL1.B <- Markers.tFL1.B %>% 
+  group_by(cluster) %>% 
+  top_n(9, Diff) %>% 
+  pull(gene) %>% 
+  unique()
+
+# Extract annotation data
+dfAnnotation <- data.frame(Cluster=sobj.B$tFL1@ident) %>% 
+  rownames_to_column(var = "Barcode") %>% 
+  arrange(Cluster) %>% 
+  column_to_rownames(var = "Barcode")
+
+# Extract expression data
+Matrix <- sobj.B$tFL1@data[Top.tFL1.B, rownames(dfAnnotation)] %>% as.matrix()
+
+# Sort genes by expression
+n1 <- Matrix[Top.tFL1.B[1:9], WhichCells(sobj.B$tFL1, ident = 0)] %>% 
+  rowMeans() %>% 
+  desc() %>% 
+  sort() %>% 
+  names
+
+n2 <- Matrix[Top.tFL1.B[10:18], WhichCells(sobj.B$tFL1, ident = 1)] %>% 
+  rowMeans() %>% 
+  desc() %>% 
+  sort() %>% 
+  names
+
+n3 <- Matrix[Top.tFL1.B[19:27], WhichCells(sobj.B$tFL1, ident = 2)] %>% 
+  rowMeans() %>% 
+  desc() %>% 
+  sort() %>% 
+  names
+
+# Arrange Matrix by the order defined above
+Matrix <- Matrix[c(n1, n2, n3),  ]
+
+# Scale Matrix by the Maximum of each row
+Matrix <- Matrix/rowMaxs(Matrix)
+
+# Heatmap
+pheatmap::pheatmap(Matrix,
+                   annotation_col = dfAnnotation, 
+                   annotation_colors = list(Cluster = c("0"="#4daf4a", 
+                                                        "1"="#d95f02", "2"="#7570b3")),
+                   show_colnames=F, 
+                   cluster_cols = F, 
+                   legend = F,
+                   cluster_rows = F,
+                   fontsize_row = 7, 
+                   gaps_col = c(table(dfAnnotation)[1], sum(table(dfAnnotation)[c(1, 2)])),
+                   gaps_row =c(9,18),
+                   color=inferno(10), 
+                   breaks = seq(0, 1, length.out=10), 
+                   na_col = "#440154FF",
+                   annotation_legend = F
+                   )
+
+```
+
+# Analysis of T cells
+```{r}
+
+sobj.T <- lapply(sobj, function(x) { 
+  
+ 
+  x <- SubsetData(object=x, subset.name = "Population", accept.value = c("T"), subset.raw = T, 
+             do.clean = F, do.scale = F, do.center = F)
+
+  x <- ScaleData(x, display.progress = F, do.par = T, num.cores = 4,
+                 vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+  
+  return(x)
+  
+  })
+
+Markers.T <- list()
+top.T <- list()
+
+
+```
+
+## DLBCL1
+This sample harbors hardly any few T cells. Thereby, analysis of T cells only is skipped.
+```{r}
+
+sobj.T$DLBCL1@data %>% ncol()
+
+```
+
+## DLBCL2
+### tSNE
+```{r}
+
+sobj.T$DLBCL2 <- short.SeuratProc(sobj.T$DLBCL2, ClustDims = 1:12, tDims = 1:20, 
+                                  r=0.6, perplexity = 20)
+
+TSNEPlot(sobj.T$DLBCL2, do.label = T, no.legend=T)
+
+```
+
+### DE genes
+```{r}
+
+Markers.T$DLBCL2 <- FindAllMarkers(sobj.T$DLBCL2, logfc.threshold = 0.25, 
+                                   only.pos = T)
+
+top.T$DLBCL2 <- Markers.T$DLBCL2 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.T$DLBCL2, genes.use = top.T$DLBCL2, slim.col.label = T, 
+          use.scaled = T, group.spacing = 0.25)
+
+Markers.T$DLBCL2 %>% filter(p_val_adj<0.05)
+
+```
+
+## DLBCL3
+### tSNE
+```{r}
+
+sobj.T$DLBCL3 <- short.SeuratProc(sobj.T$DLBCL3, ClustDims = 1:12, tDims = 1:20, 
+                                  r=0.6, perplexity = 20)
+
+TSNEPlot(sobj.T$DLBCL3, do.label = T, no.legend=T)
+
+```
+
+### DE genes 
+```{r}
+
+Markers.T$DLBCL3 <- FindAllMarkers(sobj.T$DLBCL3, logfc.threshold = 0.25, 
+                                   only.pos = T)
+
+top.T$DLBCL3 <- Markers.T$DLBCL3 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.T$DLBCL3, genes.use = top.T$DLBCL3, slim.col.label = T, 
+          use.scaled = T, group.spacing = 0.25)
+
+Markers.T$DLBCL3 %>% filter(p_val_adj<0.05)
+
+```
+
+## tFL1
+### tSNE
+```{r}
+
+sobj.T$tFL1 <- short.SeuratProc(sobj.T$tFL1, ClustDims = 1:12, tDims = 1:12, 
+                                  r=0.6, perplexity = 40)
+
+TSNEPlot(sobj.T$tFL1, do.label = T, no.legend=T)
+
+# Cluster 5 contains remaining B cells, thereby we remove them and repeat analysis
+FeaturePlot(sobj.T$tFL1, features.plot = c("CD79A", "CD3E"))
+
+sobj.T$tFL1 <- SubsetData(sobj.T$tFL1, ident.remove = 5)
+
+sobj.T$tFL1 <- ScaleData(sobj.T$tFL1, display.progress = F, do.par = T, num.cores = 3,
+                 vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+sobj.T$tFL1 <- short.SeuratProc(sobj.T$tFL1, ClustDims = 1:10, tDims = 1:12, 
+                                r=0.5, perplexity = 20)
+
+TSNEPlot(sobj.T$tFL1, do.label = T, no.legend=T)
+
+```
+
+### DE genes
+```{r}
+
+Markers.T$tFL1 <- FindAllMarkers(sobj.T$tFL1, logfc.threshold = 0.25, 
+                                   only.pos = T)
+
+top.T$tFL1 <- Markers.T$tFL1 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.T$tFL1, genes.use = top.T$tFL1, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers.T$tFL1 %>% filter(p_val_adj<0.05)
+
+```
+
+## tFL2
+### tSNE
+```{r}
+
+sobj.T$tFL2 <- short.SeuratProc(sobj.T$tFL2, ClustDims = 1:12, tDims = 1:12, 
+                                  r=0.6, perplexity = 20)
+
+TSNEPlot(sobj.T$tFL2, do.label = T, no.legend=T)
+
+```
+
+### DE genes
+```{r}
+
+Markers.T$tFL2 <- FindAllMarkers(sobj.T$tFL2, logfc.threshold = 0.25, 
+                                   only.pos = T)
+
+top.T$tFL2 <- Markers.T$tFL2 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.T$tFL2, genes.use = top.T$tFL2, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers.T$tFL2 %>% filter(p_val_adj<0.05)
+
+```
+
+## FL1
+### tSNE
+```{r}
+
+sobj.T$FL1 <- short.SeuratProc(sobj.T$FL1, ClustDims = 1:12, tDims = 1:12, 
+                                  r=0.6, perplexity = 20)
+
+TSNEPlot(sobj.T$FL1, do.label = T, no.legend=T)
+
+```
+
+### DE genes
+```{r}
+
+Markers.T$FL1 <- FindAllMarkers(sobj.T$FL1, logfc.threshold = 0.25, 
+                                   only.pos = T)
+
+top.T$FL1 <- Markers.T$FL1 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.T$FL1, genes.use = top.T$FL1, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers.T$FL1 %>% filter(p_val_adj<0.05)
+
+```
+
+## FL2
+### tSNE
+```{r}
+
+sobj.T$FL2 <- short.SeuratProc(sobj.T$FL2, ClustDims = 1:12, tDims = 1:12, 
+                                  r=0.6, perplexity = 20)
+
+TSNEPlot(sobj.T$FL2, do.label = T, no.legend=T)
+
+```
+
+### DE genes
+```{r}
+
+Markers.T$FL2 <- FindAllMarkers(sobj.T$FL2, logfc.threshold = 0.25, 
+                                   only.pos = T)
+
+top.T$FL2 <- Markers.T$FL2 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.T$FL2, genes.use = top.T$FL2, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers.T$FL2 %>% filter(p_val_adj<0.05)
+
+```
+
+## FL3
+### tSNE
+```{r}
+
+sobj.T$FL3 <- short.SeuratProc(sobj.T$FL3, ClustDims = 1:12, tDims = 1:12, 
+                                  r=0.6, perplexity = 20)
+
+TSNEPlot(sobj.T$FL3, do.label = T, no.legend=T)
+
+# Cluster 4 contains remiaining B cells, thereby we remove them and repeat analysis
+FeaturePlot(sobj.T$FL3, features.plot = c("CD79A", "CD3E"))
+
+sobj.T$FL3 <- SubsetData(sobj.T$FL3, ident.remove = 4)
+sobj.T$FL3 <- ScaleData(sobj.T$FL3, display.progress = F, do.par = T, num.cores = 3,
+                 vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+sobj.T$FL3 <- short.SeuratProc(sobj.T$FL3, ClustDims = 1:14, tDims = 1:12, 
+                                r=0.5, perplexity = 20)
+
+TSNEPlot(sobj.T$FL3, do.label = T, no.legend=T)
+
+```
+
+### DE genes
+```{r}
+
+Markers.T$FL3 <- FindAllMarkers(sobj.T$FL3, logfc.threshold = 0.25, 
+                                   only.pos = T)
+
+top.T$FL3 <- Markers.T$FL3 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.T$FL3, genes.use = top.T$FL3, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers.T$FL3 %>% filter(p_val_adj<0.05)
+
+```
+
+## FL4
+### tSNE
+```{r}
+
+sobj.T$FL4 <- short.SeuratProc(sobj.T$FL4, ClustDims = 1:18, tDims = 1:12, 
+                                  r=0.8, perplexity = 20)
+
+TSNEPlot(sobj.T$FL4, do.label = T, no.legend=T)
+
+# Cluster 3 contains some NK cells, thereby we remove them and repeat analysis
+FeaturePlot(sobj.T$FL4, features.plot = c("NKG7", "CD3E"))
+
+sobj.T$FL4 <- SubsetData(sobj.T$FL4, ident.remove = 3)
+sobj.T$FL4 <- ScaleData(sobj.T$FL4, display.progress = F, do.par = T, num.cores = 3,
+                 vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+sobj.T$FL4 <- short.SeuratProc(sobj.T$FL4, ClustDims = 1:10, tDims = 1:12, 
+                                r=0.6, perplexity = 20)
+
+TSNEPlot(sobj.T$FL4, do.label = T, no.legend=T)
+
+```
+
+### DE genes
+```{r}
+
+Markers.T$FL4 <- FindAllMarkers(sobj.T$FL4, logfc.threshold = 0.25, 
+                                   only.pos = T)
+
+top.T$FL4 <- Markers.T$FL4 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.T$FL4, genes.use = top.T$FL4, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers.T$FL4 %>% filter(p_val_adj<0.05)
+
+```
+
+## rLN1
+#### tSNE
+```{r}
+
+sobj.T$rLN1 <- short.SeuratProc(sobj.T$rLN1, ClustDims = 1:12, tDims = 1:12, 
+                                  r=0.4, perplexity = 20)
+
+TSNEPlot(sobj.T$rLN1, do.label = T, no.legend=T)
+
+# Cluster 4 contains some B and NK cells, thereby we remove them and repeat analysis
+FeaturePlot(sobj.T$rLN1, features.plot = c("CD79A", "CD3E"))
+FeaturePlot(sobj.T$rLN1, features.plot = c("NKG7", "CD3E"))
+
+sobj.T$rLN1 <- SubsetData(sobj.T$rLN1, ident.remove = 4)
+sobj.T$rLN1 <- ScaleData(sobj.T$rLN1, display.progress = F, do.par = T, num.cores = 3,
+                 vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+sobj.T$rLN1 <- short.SeuratProc(sobj.T$rLN1, ClustDims = 1:14, tDims = 1:12, 
+                                r=0.4, perplexity = 20)
+
+TSNEPlot(sobj.T$rLN1, do.label = T, no.legend=T)
+
+
+```
+
+### DE genes
+```{r}
+
+Markers.T$rLN1 <- FindAllMarkers(sobj.T$rLN1, logfc.threshold = 0.25, 
+                                   only.pos = T)
+
+top.T$rLN1 <- Markers.T$rLN1 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.T$rLN1, genes.use = top.T$rLN1, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers.T$rLN1 %>% filter(p_val_adj<0.05)
+
+```
+
+## rLN2
+### tSNE
+```{r}
+
+sobj.T$rLN2 <- short.SeuratProc(sobj.T$rLN2, ClustDims = 1:12, tDims = 1:12, 
+                                  r=0.6, perplexity = 20)
+
+TSNEPlot(sobj.T$rLN2, do.label = T, no.legend=T)
+
+# Cluster 4 contains some NK cells (very bottom clump of cells)
+FeaturePlot(sobj.T$rLN2, features.plot = "NKG7")
+
+```
+
+### DE genes
+```{r}
+
+Markers.T$rLN2 <- FindAllMarkers(sobj.T$rLN2, logfc.threshold = 0.25, 
+                                   only.pos = T)
+
+top.T$rLN2 <- Markers.T$rLN2 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.T$rLN2, genes.use = top.T$rLN2, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers.T$rLN2 %>% filter(p_val_adj<0.05)
+
+```
+
+## rLN3
+### tSNE
+```{r}
+
+sobj.T$rLN3 <- short.SeuratProc(sobj.T$rLN3, ClustDims = 1:12, tDims = 1:12, 
+                                  r=0.6, perplexity = 20)
+
+TSNEPlot(sobj.T$rLN3, do.label = T, no.legend=T)
+
+# Cluster 4 contains some NK cells
+FeaturePlot(sobj.T$rLN3, features.plot = c("NKG7", "CD3D"))
+
+sobj.T$rLN3 <- SubsetData(sobj.T$rLN3, ident.remove = 4)
+sobj.T$rLN3 <- ScaleData(sobj.T$rLN3, display.progress = F, do.par = T, num.cores = 3,
+                 vars.to.regress = c("S.Score", "G2M.Score", "nUMI","pc.mito"))
+
+sobj.T$rLN3 <- short.SeuratProc(sobj.T$rLN3, ClustDims = 1:14, tDims = 1:12, 
+                                r=0.4, perplexity = 20)
+
+TSNEPlot(sobj.T$rLN3, do.label = T, no.legend=T)
+
+```
+
+### DE genes
+```{r}
+
+Markers.T$rLN3 <- FindAllMarkers(sobj.T$rLN3, logfc.threshold = 0.25, 
+                                   only.pos = T)
+
+top.T$rLN3 <- Markers.T$rLN3 %>% group_by(cluster) %>% 
+  top_n(10, avg_logFC) %>% dplyr::arrange(cluster) %>% pull(gene)
+
+DoHeatmap(sobj.T$rLN3, genes.use = top.T$rLN3, slim.col.label = T, 
+          group.spacing = 0.25)
+
+Markers.T$rLN3 %>% filter(p_val_adj<0.05)
+
+```
+
+# Analysis of merged data sets
+## B cells
+### Merge data sets
+```{r}
+
+for (i in 2:length(sobj.B)) {
+  
+  if(i==2){ Merge.B <-  MergeSeurat(sobj.B$DLBCL1, sobj.B[[2]], do.normalize = F,
+                                    add.cell.id1 = names(sobj.B)[1], add.cell.id2 = names(sobj.B)[2])}
+  
+   else{ Merge.B <-  MergeSeurat(Merge.B, sobj.B[[i]], do.normalize = F,
+                                 add.cell.id2 = names(sobj.B)[i])}
+  }
+
+# Clean meta data and add information about batch
+Merge.B@meta.data <- 
+  Merge.B@meta.data %>% 
+  rownames_to_column(var = "Barcode") %>%
+  select(-contains("res.")) %>% 
+  dplyr::mutate(Sample=strsplit(Barcode, split = "_") %>% 
+           sapply(., "[[", 1),
+         Batch = ifelse(Sample %in% c("DLBCL3", "tFL2", "FL4", "rLN2", "rLN3"), 2, 1)) %>%
+  column_to_rownames(var = "Barcode") 
+
+# Rerun Seurat workflow
+mito.genes <- grep(pattern = "^MT-", x = rownames(x = Merge.B), value = T)
+  pc.mito <- Matrix::colSums(Merge.B@raw.data[mito.genes, ])/Matrix::colSums(Merge.B@raw.data)
+  
+# Readout proportion of ribosomal genes 
+ribo.genes <- grep(pattern = "^RP", x = rownames(x = Merge.B), value = T)
+pc.ribo <- Matrix::colSums(Merge.B@raw.data[ribo.genes, ])/Matrix::colSums(Merge.B@raw.data)
+  
+Merge.B <- AddMetaData(Merge.B, metadata = pc.mito, col.name = "pc.mito")
+Merge.B <- AddMetaData(Merge.B, metadata = pc.ribo, col.name = "pc.ribo")
+
+Merge.B <- NormalizeData(Merge.B, normalization.method = "LogNormalize")
+
+Merge.B <- FindVariableGenes(Merge.B, mean.function = ExpMean, dispersion.function = LogVMR,
+                             x.low.cutoff = 0.1, x.high.cutoff = 3, y.cutoff = 0.5)
+  
+Merge.B <- CellCycleScoring(Merge.B, s.genes = s.genes, g2m.genes = g2m.genes)
+
+Merge.B <- ScaleData(Merge.B, vars.to.regress = c("nUMI", "S.Score", "G2M.Score", "pc.mito"), 
+                     genes.use = Merge.B@var.genes, 
+                     do.par = T, num.cores = 3)
+
+# Set batch to main ident
+Merge.B <- SetIdent(Merge.B, cells.use = WhichCells(Merge.B, subset.name = "Batch", accept.value = 1), 1)
+Merge.B <- SetIdent(Merge.B, cells.use = WhichCells(Merge.B, subset.name = "Batch", accept.value = 2), 2)
+
+
+```
+
+We randomly pick equal amount of cells per donor/sample for batch correaction and joint analysis to avoid clustering artefacts as a consequence of  differences in the number of B cells between the samples. In addition, this improves the visual interpretation of dimensionality reduction plots. Also, this speeds up the computation time. Rerunnning the sampling leads to comparable results.
+
+Batch correction is performed using the `fastMNN`workflow of the _scran_ bioconductor package which is a part of the _SimpleSingleCellSequencing_ workflow. Please not that in the meantime the `fastMNN` function is part of a new bioconductor package called _batchelor_.  
+
+Upon request, we can provide also the batch corrected objects. 
+
+### Batch correction
+#### Prepare data
+```{r}
+
+Subset_Merge.B <- Merge.B@meta.data %>% rownames_to_column(var="Barcode") %>% 
+  group_by(Sample) %>% sample_n(500) %>% pull(Barcode)
+
+Merge.B <- SubsetData(Merge.B, cells.use = Subset_Merge.B)
+
+# Convert to single cell experiment
+sce_B <- as.SingleCellExperiment(Merge.B)
+
+```
+
+#### Compute SumFactors and Normalize
+```{r}
+
+clusters <- quickCluster(sce_B, min.size=200, get.spikes=FALSE, method="igraph", use.ranks=T)
+sce_B <- computeSumFactors(sce_B)
+sce_B <- normalize(sce_B)
+
+```
+
+#### Variance modelling
+```{r}
+
+alt.fit2 <- trendVar(sce_B, use.spikes=FALSE, block=sce_B$ident)
+alt.decomp2 <- decomposeVar(sce_B, alt.fit2, block=sce_B$ident)
+
+top.hvgs <- order(alt.decomp2$bio, decreasing=TRUE)
+
+```
+
+#### Find correlated genes
+```{r}
+
+null.dist <- correlateNull(ncol(sce_B))
+
+cor.pairs <- correlatePairs(sce_B, subset.row=top.hvgs[1:200], null.dist=null.dist)
+
+null.dist2 <- correlateNull(block=sce_B$ident, iter=1e5)
+cor.pairs2 <- correlatePairs(sce_B, subset.row=top.hvgs[1:200], 
+    null.dist=null.dist2, block=sce_B$ident)
+
+cor.genes <- correlatePairs(sce_B, subset.row=top.hvgs[1:200], 
+    null.dist=null.dist, per.gene=TRUE)
+
+```
+
+#### Separate batches
+```{r}
+
+batch1 <- Merge.B@meta.data %>%
+  rownames_to_column(var = "Barcode") %>%
+  dplyr::filter(Batch==1) %>% 
+  pull(Barcode)
+
+batch2 <- Merge.B@meta.data %>%
+  rownames_to_column(var = "Barcode") %>%
+  dplyr::filter(Batch==2) %>% 
+  pull(Barcode)
+
+sce_B1 <- sce_B[, colnames(sce_B) %in% batch1]
+sce_B2 <- sce_B[, colnames(sce_B) %in% batch2]
+
+```
+
+#### Run MNN
+```{r}
+
+out <- fastMNN(sce_B1, sce_B2)
+
+combined_B <- cbind(sce_B1, sce_B2)
+reducedDim(combined_B, "pca") <- out$correct
+
+plotReducedDim(combined_B, "pca", colour_by="Batch")
+
+```
+
+Output is a pca like object which can then be implemented in the Seurat object as follows. 
+#### Return to Seurat Object
+```{r}
+
+Merge.B <- RunPCA(Merge.B, pc.genes = Merge.B@var.genes, do.print = TRUE, 
+                  pcs.print = 1:5, genes.print = 10)
+
+Merge.B@dr$mnn <- Merge.B@dr$pca
+
+rownames(out$corrected) <- colnames(sce_B)
+colnames(out$corrected) <- paste0("PC", c(1:50))
+Merge.B@dr$mnn@cell.embeddings <- out$corrected
+
+rownames(out$rotation) <- rownames(sce_B)
+colnames(out$rotation) <- paste0("PC", c(1:50))
+Merge.B@dr$mnn@gene.loadings <- out$rotation
+
+Merge.B@dr$mnn@sdev <- apply(out$corrected, 2, sd) %>% unname()
+
+# Rerun Seurat workflow on mnn components
+Merge.B <-  FindClusters(Merge.B, reduction.type = "mnn", dims.use = 1:20, 
+                        resolution = 0.4, force.recalc = T, print.output = F)
+Merge.B <-  RunUMAP(Merge.B, reduction.use = "mnn", dims.use = 1:20)  
+
+DimPlot(Merge.B, reduction.use = "umap", group.by = "Sample")
+
+```
+
+## T cells
+### Merge data sets
+```{r}
+
+for (i in 2:length(sobj.T)) {
+  
+  if(i==2){ Merge.T <-  MergeSeurat(sobj.T$DLBCL1, sobj.T[[2]], do.normalize = F,
+                                    add.cell.id1 = names(sobj.T)[1], add.cell.id2 = names(sobj.T)[2])}
+  
+  else{ Merge.T <-  MergeSeurat(Merge.T, sobj.T[[i]], do.normalize = F,
+                                add.cell.id2 = names(sobj.T)[i])}
+  }
+
+# Clean meta data and add information about batch
+Merge.T@meta.data <- 
+  Merge.T@meta.data %>% 
+  rownames_to_column(var = "Barcode") %>%
+  select(-contains("res.")) %>% 
+  dplyr::mutate(Sample=strsplit(Barcode, split = "_") %>% 
+           sapply(., "[[", 1),
+         Batch = ifelse(Sample %in% c("DLBCL3", "tFL2", "FL4", "rLN2", "rLN3"), 2, 1)) %>%
+  column_to_rownames(var = "Barcode") 
+
+# Rerun Seurat workflow
+mito.genes <- grep(pattern = "^MT-", x = rownames(x = Merge.T), value = T)
+  pc.mito <- Matrix::colSums(Merge.T@raw.data[mito.genes, ])/Matrix::colSums(Merge.T@raw.data)
+  
+# Readout proportion of ribosomal genes 
+ribo.genes <- grep(pattern = "^RP", x = rownames(x = Merge.T), value = T)
+pc.ribo <- Matrix::colSums(Merge.T@raw.data[ribo.genes, ])/Matrix::colSums(Merge.T@raw.data)
+  
+Merge.T <- AddMetaData(Merge.T, metadata = pc.mito, col.name = "pc.mito")
+Merge.T <- AddMetaData(Merge.T, metadata = pc.ribo, col.name = "pc.ribo")
+
+Merge.T <- NormalizeData(Merge.T, normalization.method = "LogNormalize")
+
+Merge.T <- FindVariableGenes(Merge.T, mean.function = ExpMean, dispersion.function = LogVMR,
+                             x.low.cutoff = 0.1, x.high.cutoff = 3, y.cutoff = 0.5)
+  
+Merge.T <- CellCycleScoring(Merge.T, s.genes = s.genes, g2m.genes = g2m.genes)
+
+Merge.T <- ScaleData(Merge.T, vars.to.regress = c("nUMI", "S.Score", "G2M.Score", "pc.mito"), 
+                     genes.use = Merge.T@var.genes, 
+                     do.par = T, num.cores = 3)
+
+# Set batch as main ident
+Merge.T <- SetIdent(Merge.T, cells.use = WhichCells(Merge.T, subset.name = "Batch", accept.value = 1), "Run1")
+Merge.T <- SetIdent(Merge.T, cells.use = WhichCells(Merge.T, subset.name = "Batch", accept.value = 2), "Run2")
+
+```
+
+### Batch correction
+To enable the exact quantification of the frequency of certain populations in specific samples, here we do not downsample the different donors. Please note that downsampling rather reduces the cellular heterogeneity. 
+
+Again, batch correction is performed using the `fastMNN`workflow of the _scran_ bioconductor package which is a part of the _SimpleSingleCellSequencing_ workflow. Please not that in the meantime the `fastMNN` function is part of a new bioconductor package called _batchelor_.  
+
+```{r}
+
+sce_T <- as.SingleCellExperiment(Merge.T)
+
+```
+
+#### Compute SumFactors and Normalize
+```{r}
+
+clusters <- quickCluster(sce_T, min.size=200, get.spikes=FALSE, method="igraph", use.ranks=TRUE)
+sce_T <- computeSumFactors(sce_T)
+sce_T <- normalize(sce_T)
+
+```
+#### Variance modelling
+```{r}
+
+alt.fit2 <- trendVar(sce_T, use.spikes=FALSE, block=sce_T$ident)
+alt.decomp2 <- decomposeVar(sce_T, alt.fit2, block=sce_T$ident)
+
+top.hvgs <- order(alt.decomp2$bio, decreasing=TRUE)
+
+```
+
+#### Find correlated genes
+```{r}
+
+null.dist <- correlateNull(ncol(sce_T))
+
+cor.pairs <- correlatePairs(sce_T, subset.row=top.hvgs[1:200], null.dist=null.dist)
+
+null.dist2 <- correlateNull(block=sce_T$ident, iter=1e5)
+cor.pairs2 <- correlatePairs(sce_T, subset.row=top.hvgs[1:200], 
+    null.dist=null.dist2, block=sce_T$ident)
+
+cor.genes <- correlatePairs(sce_T, subset.row=top.hvgs[1:200], 
+    null.dist=null.dist, per.gene=TRUE)
+
+```
+
+#### Separate batches
+```{r}
+
+batch1 <- Merge.T@meta.data %>%
+  rownames_to_column(var = "Barcode") %>%
+  dplyr::filter(Batch==1) %>% 
+  pull(Barcode)
+
+batch2 <- Merge.T@meta.data %>%
+  rownames_to_column(var = "Barcode") %>%
+  dplyr::filter(Batch==2) %>% 
+  pull(Barcode)
+
+sce_T1 <- sce_T[, colnames(sce_T) %in% batch1]
+sce_T2 <- sce_T[, colnames(sce_T) %in% batch2]
+
+```
+
+#### Run MNN
+```{r}
+
+out <- fastMNN(sce_T1, sce_T2)
+
+dim(out$corrected)
+
+combined_T <- cbind(sce_T1, sce_T2)
+reducedDim(combined_T, "pca") <- out$correct
+
+plotReducedDim(combined_T, "pca", colour_by="Batch")
+
+
+reducedDim(combined_T, "pca") <- out$corrected
+
+```
+
+#### Return to Seurat Object
+```{r}
+
+Merge.T <- RunPCA(Merge.T, pc.genes = Merge.T@var.genes, do.print = TRUE, 
+                  pcs.print = 1:5, genes.print = 10)
+
+Merge.T@dr$mnn <- Merge.T@dr$pca
+
+rownames(out$corrected) <- colnames(sce_T)
+colnames(out$corrected) <- paste0("PC", c(1:50))
+Merge.T@dr$mnn@cell.embeddings <- out$corrected
+
+rownames(out$rotation) <- rownames(sce_T)
+colnames(out$rotation) <- paste0("PC", c(1:50))
+Merge.T@dr$mnn@gene.loadings <- out$rotation
+
+Merge.T@dr$mnn@sdev <- apply(out$corrected, 2, sd) %>% unname()
+
+# Rerun Seurat workflow on mnn components
+Merge.T <-  FindClusters(Merge.T, reduction.type = "pca", dims.use = 1:12, k.param = 15,
+                         resolution = 0.3, force.recalc = T, print.output = F)
+
+Merge.T <-  RunUMAP(Merge.T, reduction.use = "pca", min_dist = 0.5, dims.use = 1:18, 
+                    do.fast = TRUE, n_neighbors =100)  
+
+DimPlot(Merge.T, reduction.use = "umap", group.by="sample", do.label = T)
+
+```
+
+# Session Info
+```{r}
+
+sessionInfo()
+
+```
