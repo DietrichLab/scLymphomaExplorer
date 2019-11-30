@@ -354,7 +354,7 @@ offset.label <- offset-0.75
 alpha.sep <- 0.35
 gp.label <- gpar(cex=0.9, fontface="bold")
 
-DF_filled %>% filter(p.fisher <= 0.01) %>% dplyr::count(Name) %>% pull(Name) %>% as.character()
+y.axis <- DF_filled %>% filter(p.fisher <= 0.01) %>% dplyr::count(Name) %>% pull(Name) %>% as.character()
 
 DF_filled <- DF_filled %>% filter(Name %in% y.axis) %>%
   mutate(Name = factor(Name, levels=rev(y.axis)))
