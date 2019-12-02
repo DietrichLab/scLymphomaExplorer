@@ -1,0 +1,3 @@
+[submodule "shiny-app"]
+	path = shiny-app
+	url = https://github.com/anders-biostat/single-cell-lymphoma-explorer.git
